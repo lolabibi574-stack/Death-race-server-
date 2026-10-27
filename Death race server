@@ -1,0 +1,261 @@
+// DEATH RACE Realtime Server – Room Join Fix
+const PORT = Number(process.env.PORT || 8080);
+const MAX_PLAYERS = 8;
+const MAX_ROOMS = 300;
+
+type ClientData = { playerId: string | null; roomCode: string | null };
+
+type Player = {
+  id: string;
+  name: string;
+  joinedAt: number;
+  ready: boolean;
+  ws: any;
+  characterId: string;
+  abilityLevel: number;
+};
+
+type Room = {
+  code: string;
+  hostId: string;
+  mapId: string;
+  status: "lobby" | "countdown" | "racing";
+  startAt: number | null;
+  createdAt: number;
+  players: Map<string, Player>;
+};
+
+const rooms = new Map<string, Room>();
+
+function cleanName(value: unknown): string {
+  const out = String(value || "Racer").replace(/[<>\u0000-\u001f]/g, "").trim().slice(0, 18);
+  return out || "Racer";
+}
+
+function cleanCode(value: unknown): string {
+  return String(value || "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 8);
+}
+
+function cleanMap(value: unknown): string {
+  const map = String(value || "neon-coast");
+  const valid = new Set(["neon-coast", "redrock-wasteland", "ashfall-volcano"]);
+  return valid.has(map) ? map : "neon-coast";
+}
+
+function cleanCharacter(value: unknown): string {
+  const id = String(value || "blaze").toLowerCase();
+  const valid = new Set(["blaze", "frost", "volt", "terra", "zephyr", "shade", "chrono", "magnus", "rex", "nova"]);
+  return valid.has(id) ? id : "blaze";
+}
+
+function randomCode(): string {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  for (let attempt = 0; attempt < 30; attempt++) {
+    let code = "";
+    for (let i = 0; i < 6; i++) code += alphabet[Math.floor(Math.random() * alphabet.length)];
+    if (!rooms.has(code)) return code;
+  }
+  return crypto.randomUUID().replace(/-/g, "").slice(0, 6).toUpperCase();
+}
+
+function send(ws: any, value: unknown) {
+  try {
+    if (ws.readyState === 1) ws.send(JSON.stringify(value));
+  } catch {}
+}
+
+function fail(ws: any, message: string) {
+  send(ws, { type: "error", message });
+}
+
+function publicPlayer(p: Player) {
+  return {
+    id: p.id,
+    name: p.name,
+    joinedAt: p.joinedAt,
+    ready: p.ready,
+    characterId: p.characterId,
+    client: "web",
+  };
+}
+
+function roster(room: Room) {
+  return [...room.players.values()]
+    .sort((a, b) => a.joinedAt - b.joinedAt || a.id.localeCompare(b.id))
+    .map(publicPlayer);
+}
+
+function publishRoster(room: Room) {
+  const message = {
+    type: "roster",
+    roomCode: room.code,
+    hostId: room.hostId,
+    mapId: room.mapId,
+    status: room.status,
+    startAt: room.startAt,
+    players: roster(room),
+  };
+  for (const p of room.players.values()) send(p.ws, message);
+}
+
+function join(ws: any, data: any) {
+  if (ws.data.roomCode) return fail(ws, "You are already in a room.");
+
+  const creating = data.createRoom === true;
+  let code = cleanCode(data.roomCode);
+  let room: Room | undefined;
+
+  if (creating) {
+    if (rooms.size >= MAX_ROOMS) return fail(ws, "The server is busy. Try again shortly.");
+    if (code.length < 4 || rooms.has(code)) code = randomCode();
+    let attempts = 0;
+    while (rooms.has(code) && attempts < 30) {
+      code = randomCode();
+      attempts++;
+    }
+    if (rooms.has(code)) return fail(ws, "Could not allocate a unique room code. Please try again.");
+
+    room = {
+      code,
+      hostId: "",
+      mapId: cleanMap(data.mapId),
+      status: "lobby",
+      startAt: null,
+      createdAt: Date.now(),
+      players: new Map(),
+    };
+    rooms.set(code, room);
+  } else {
+    // FIXED: only join existing rooms
+    if (code.length < 4) return fail(ws, "Enter a room code with at least 4 characters.");
+    room = rooms.get(code);
+    if (!room) {
+      return fail(ws, `Room ${code} was not found. Check the code with the host and try again.`);
+    }
+  }
+
+  if (room.status !== "lobby") return fail(ws, "That room is already racing. Try another room.");
+  if (room.players.size >= MAX_PLAYERS) return fail(ws, "That room is full (8 drivers maximum).");
+
+  const id = crypto.randomUUID();
+  const player: Player = {
+    id,
+    name: cleanName(data.name),
+    joinedAt: Date.now(),
+    ready: false,
+    ws,
+    characterId: cleanCharacter(data.characterId),
+    abilityLevel: Math.max(0, Math.min(3, Math.floor(Number(data.abilityLevel) || 0))),
+  };
+
+  room.players.set(id, player);
+  if (!room.hostId || !room.players.has(room.hostId)) room.hostId = id;
+
+  ws.data.playerId = id;
+  ws.data.roomCode = code;
+
+  send(ws, {
+    type: "welcome",
+    selfId: id,
+    roomCode: code,
+    hostId: room.hostId,
+    mapId: room.mapId,
+    maxPlayers: MAX_PLAYERS,
+    status: room.status,
+    startAt: room.startAt,
+    inventory: null,
+    characterId: player.characterId,
+    abilityLevel: player.abilityLevel,
+    players: roster(room),
+    states: [],
+  });
+
+  publishRoster(room);
+}
+
+function releaseSocket(ws: any) {
+  const roomCode = ws.data.roomCode;
+  const playerId = ws.data.playerId;
+  ws.data.roomCode = null;
+  ws.data.playerId = null;
+  if (!roomCode || !playerId) return;
+
+  const room = rooms.get(roomCode);
+  if (!room) return;
+
+  room.players.delete(playerId);
+
+  if (room.players.size === 0) {
+    setTimeout(() => {
+      const current = rooms.get(roomCode);
+      if (current && current.players.size === 0) rooms.delete(roomCode);
+    }, 60_000);
+    return;
+  }
+
+  if (room.hostId === playerId) {
+    const nextHost = [...room.players.values()].sort((a, b) => a.joinedAt - b.joinedAt)[0];
+    room.hostId = nextHost.id;
+  }
+
+  publishRoster(room);
+}
+
+function handleMessage(ws: any, raw: string | Buffer) {
+  const text = typeof raw === "string" ? raw : raw.toString();
+  if (text.length > 4096) return fail(ws, "Message too large.");
+
+  let data: any;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    return fail(ws, "Invalid JSON message.");
+  }
+
+  if (!data || typeof data.type !== "string") return fail(ws, "Invalid message.");
+
+  if (data.type === "ping") return send(ws, { type: "pong", at: Date.now() });
+  if (data.type === "join") return join(ws, data);
+
+  fail(ws, "Join a room first.");
+}
+
+const server = Bun.serve<ClientData>({
+  port: PORT,
+  fetch(req, server) {
+    const url = new URL(req.url);
+
+    if (url.pathname === "/health") {
+      return Response.json({
+        ok: true,
+        service: "death-race-realtime",
+        rooms: rooms.size,
+        activePlayers: [...rooms.values()].reduce((n, r) => n + r.players.size, 0),
+        protocol: "death-race-v2",
+        uptimeSeconds: Math.floor(process.uptime()),
+      });
+    }
+
+    if (url.pathname === "/ws") {
+      if (server.upgrade(req, { data: { playerId: null, roomCode: null } })) {
+        return undefined;
+      }
+      return new Response("WebSocket upgrade required.", { status: 426 });
+    }
+
+    return new Response("Not found.", { status: 404 });
+  },
+  websocket: {
+    open(ws) {
+      send(ws, { type: "hello", protocol: "death-race-v2" });
+    },
+    message(ws, message) {
+      handleMessage(ws, message as string | Buffer);
+    },
+    close(ws) {
+      releaseSocket(ws);
+    },
+  },
+});
+
+console.log(`DEATH RACE realtime server listening on port ${server.port}`);
