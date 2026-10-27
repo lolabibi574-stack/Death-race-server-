@@ -1,0 +1,7 @@
+{
+  "name": "death-race-realtime",
+  "version": "1.0.0",
+  "scripts": {
+    "start": "bun run server.ts"
+  }
+}
